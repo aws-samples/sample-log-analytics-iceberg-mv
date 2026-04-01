@@ -1,0 +1,39 @@
+{
+  "DeliveryStreamName": "iceberg-logs-stream",
+  "DeliveryStreamType": "DirectPut",
+  "IcebergDestinationConfiguration": {
+    "RoleARN": "arn:aws:iam::ACCOUNT-ID:role/FirehoseIcebergDeliveryRole",
+    "CatalogConfiguration": {
+      "CatalogARN": "arn:aws:glue:us-east-1:ACCOUNT-ID:catalog"
+    },
+    "DestinationTableConfigurationList": [
+      {
+        "DestinationDatabaseName": "streaming_analytics",
+        "DestinationTableName": "application_logs"
+      }
+    ],
+    "BufferingHints": {
+      "SizeInMBs": 128,
+      "IntervalInSeconds": 300
+    },
+    "S3Configuration": {
+      "RoleARN": "arn:aws:iam::ACCOUNT-ID:role/FirehoseIcebergDeliveryRole",
+      "BucketARN": "arn:aws:s3:::my-company-iceberg-data-bucket",
+      "Prefix": "application_logs/data/",
+      "ErrorOutputPrefix": "application_logs/errors/",
+      "CompressionFormat": "UNCOMPRESSED"
+    },
+    "ProcessingConfiguration": {
+      "Enabled": false
+    },
+    "CloudWatchLoggingOptions": {
+      "Enabled": true,
+      "LogGroupName": "/aws/kinesisfirehose/iceberg-logs-stream",
+      "LogStreamName": "IcebergDelivery"
+    },
+    "RetryOptions": {
+      "DurationInSeconds": 3600
+    }
+  }
+}
+
