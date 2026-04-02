@@ -1,4 +1,4 @@
-# AWS Glue Iceberg Materialized View Builder
+# Log analytics using the AWS Glue and Iceberg materialized view
 
 This project demonstrates an end-to-end pipeline for ingesting CloudWatch Logs into Apache Iceberg tables and building materialized views using AWS Glue.
 
