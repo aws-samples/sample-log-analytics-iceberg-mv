@@ -6,7 +6,7 @@ from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "iceberg-data-bucket", "warehouse-database-name"])
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
@@ -14,29 +14,27 @@ job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 CATALOG   = "glue_catalog"
-DATABASE  = "stream_analytics"
+iceberg_data_bucket = args.get("iceberg_data_bucket") or args.get("iceberg-data-bucket") or args["iceberg_data_bucket"]
+warehouse_db_name = args.get("warehouse_database_name") or args.get("warehouse-database-name") or args["warehouse_database_name"]
+DATABASE  = warehouse_db_name
 BASETBL   = "application_logs"
 MVVIEW    = "application_logs_mv"
-WAREHOUSE = "s3://iceberg-mv-stream-analytics/stream-analytics.db"
-
-errors = []
-
+WAREHOUSE = f"s3://{iceberg_data_bucket}/{warehouse_db_name}.db"
+print(f"=== S3 data bucket: {iceberg_data_bucket}, DATABASE: {warehouse_db_name}, WAREHOUSE: {WAREHOUSE} ===")
 
 def run_step(step_name, fn):
-    """Execute a step with error tracking. Returns True on success."""
+    """Execute a step. Raises on failure to stop the job immediately."""
     print(f"=== {step_name}: STARTED ===")
     start = time.time()
     try:
         fn()
         elapsed = round(time.time() - start, 2)
         print(f"=== {step_name}: COMPLETED ({elapsed}s) ===")
-        return True
     except Exception as e:
         elapsed = round(time.time() - start, 2)
         print(f"=== {step_name}: FAILED ({elapsed}s) — {e} ===")
         traceback.print_exc()
-        errors.append({"step": step_name, "error": str(e)})
-        return False
+        raise
 
 
 try:
@@ -78,8 +76,8 @@ try:
         spark.sql(f"DROP MATERIALIZED VIEW IF EXISTS {CATALOG}.{DATABASE}.{MVVIEW}"))
 
     # ── Step 6: Create materialized view ─────────────────────────────────
-    time.sleep(120)
-    mv_created = run_step("Step 6: Create Materialized View", lambda:
+    time.sleep(30)
+    run_step("Step 6: Create Materialized View", lambda:
         spark.sql(f"""
             CREATE MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW}
             AS SELECT
@@ -92,31 +90,22 @@ try:
     time.sleep(20)
 
     # ── Step 7: Verify MV contents ───────────────────────────────────────
-    if mv_created:
-        run_step("Step 7: Verify MV contents", lambda:
-            spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
-        time.sleep(20)
+    run_step("Step 7: Verify MV contents", lambda:
+        spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
+    time.sleep(20)
 
-        # ── Step 8: Test FULL refresh ────────────────────────────────────
-        run_step("Step 8: FULL refresh MV", lambda:
-            spark.sql(f"REFRESH MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW} FULL"))
-        time.sleep(20)
+    # ── Step 8: Test FULL refresh ────────────────────────────────────────
+    run_step("Step 8: FULL refresh MV", lambda:
+        spark.sql(f"REFRESH MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW} FULL"))
+    time.sleep(20)
 
-        run_step("Step 9: Verify post-refresh MV", lambda:
-            spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
-    else:
-        print("=== Skipping Steps 7-9: MV creation failed ===")
+    run_step("Step 9: Verify post-refresh MV", lambda:
+        spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
 
-    # ── Summary ──────────────────────────────────────────────────────────
-    if errors:
-        print(f"\n=== JOB COMPLETED WITH {len(errors)} ERROR(S) ===")
-        for err in errors:
-            print(f"  - {err['step']}: {err['error']}")
-    else:
-        print("\n=== JOB COMPLETED SUCCESSFULLY ===")
+    print("\n=== JOB COMPLETED SUCCESSFULLY ===")
 
 except Exception as e:
-    print(f"=== UNEXPECTED FATAL ERROR: {e} ===")
+    print(f"=== JOB FAILED: {e} ===")
     traceback.print_exc()
     raise
 finally:

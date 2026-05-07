@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Provisions infrastructure for an Apache Iceberg data pipeline (without Lake Formation).
+  Includes S3 storage buckets for Iceberg table data and error capture,
+  an IAM role with fine-grained permissions for AWS Glue job execution,
+  and an AWS Glue job for materialized view ETL.
+
+Parameters:
+  AccountId:
+    Type: String
+    Description: AWS account ID used in IAM policy resource ARNs
+
+  Region:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for constructing resource ARNs
+
+  DatabaseName:
+    Type: String
+    Default: stream_analytics
+    Description: Glue Catalog database name referenced in IAM policies
+
+  IcebergDataBucketName:
+    Type: String
+    Default: my-company-iceberg-data-bucket
+    Description: Name for the S3 bucket that stores Apache Iceberg table data files
+
+  IcebergErrorsBucketName:
+    Type: String
+    Default: my-company-iceberg-errors-bucket
+    Description: Name for the S3 bucket that captures failed records for troubleshooting and replay
+
+  GlueScriptBucketName:
+    Type: String
+    Default: my-company-glue-scripts-bucket
+    Description: Name for the S3 bucket that stores the Glue ETL script
+
+  GlueJobRoleName:
+    Type: String
+    Default: my-iceberg-glue-job-role
+    Description: Name for the IAM role assumed by AWS Glue jobs
+
+  GlueJobName:
+    Type: String
+    Default: my-iceberg-glue-job
+    Description: Name for the Glue job displayed in the AWS console
+
+  WorkerType:
+    Type: String
+    Default: G.1X
+    Description: Glue worker instance type (G.1X, G.2X, G.4X, etc.)
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    Description: Number of Glue workers allocated to the job
+
+  WarehouseDatabaseName:
+    Type: String
+    Default: stream_analytics
+    Description: Database name used in the Iceberg warehouse S3 path (s3://bucket/{name}.db)
+
+Resources:
+  IcebergDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref IcebergDataBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  IcebergDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IcebergDataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GlueJobAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt GlueJobRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${IcebergDataBucketName}
+              - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
+
+  IcebergErrorsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref IcebergErrorsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref GlueJobRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: glue-access-formv
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetTable
+                  - glue:GetTables
+                Resource:
+                  - !Sub arn:aws:glue:${Region}:${AccountId}:catalog
+                  - !Sub arn:aws:glue:${Region}:${AccountId}:database/${DatabaseName}
+                  - !Sub arn:aws:glue:${Region}:${AccountId}:table/${DatabaseName}/*
+        - PolicyName: iam-pass-role
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AccountId}:role/${GlueJobRoleName}
+        - PolicyName: iceberg-s3-emr-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action: "elasticmapreduce:*"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:PrincipalAccount: !Sub ${AccountId}
+        - PolicyName: glue-script-bucket-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${GlueScriptBucketName}/*
+
+  IcebergGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.1"
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptBucketName}/scripts/sample-glue-job-iceberg-materializedview-builder.py
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      DefaultArguments:
+        --conf: !Sub >-
+          spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+          --conf spark.sql.catalog.glue_catalog.type=glue
+          --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}/${WarehouseDatabaseName}.db
+          --conf spark.sql.catalog.glue_catalog.glue.region=${Region}
+          --conf spark.sql.catalog.glue_catalog.glue.id=${AccountId}
+          --conf spark.sql.catalog.glue_catalog.glue.account-id=${AccountId}
+          --conf spark.sql.catalog.glue_catalog.client.region=${Region}
+          --conf spark.sql.catalog.glue_catalog.glue.lakeformation-enabled=false
+          --conf spark.sql.defaultCatalog=glue_catalog
+          --conf spark.sql.optimizer.answerQueriesWithMVs.enabled=true
+          --conf spark.sql.materializedViews.metadataCache.enabled=true
+        --datalake-formats: iceberg
+        --iceberg-data-bucket: !Ref IcebergDataBucketName
+        --warehouse-database-name: !Ref WarehouseDatabaseName
