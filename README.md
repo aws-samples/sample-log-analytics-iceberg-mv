@@ -1,4 +1,4 @@
-# Sample: Log Analytics with Apache Iceberg Materialized Views
+# Sample Log Analytics with Apache Iceberg Materialized Views
 
 An automated deployment of a real-time data pipeline that streams CloudWatch Logs into Apache Iceberg tables with materialized views, using AWS Glue, Amazon Data Firehose, and AWS Lambda. The pipeline ingests streaming data into Iceberg, then leverages Iceberg materialized views to pre-compute aggregations for fast analytical queries.
 
