@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import sys
 import boto3
 import time
 import json
@@ -16,15 +17,34 @@ CUSTOMER_NAMES = ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve']
 # Create CloudWatch Logs client
 client = boto3.client('logs', region_name='us-east-1')
 
-# Create log stream
+# Verify log group exists
 try:
-    client.create_log_stream(
+    response = client.describe_log_groups(logGroupNamePrefix=LOG_GROUP_NAME)
+    log_groups = [lg['logGroupName'] for lg in response.get('logGroups', [])]
+    if LOG_GROUP_NAME not in log_groups:
+        print(f"ERROR: Log group '{LOG_GROUP_NAME}' does not exist. Make sure the testing AWS region is correct in boto3 client."
+              " Please create it or deploy the stack with CreateSubscriptionLogGroup=true.")
+        sys.exit(1)
+    print(f"Log group exists: {LOG_GROUP_NAME}")
+except Exception as e:
+    print(f"ERROR: Failed to check log group: {e}")
+    sys.exit(1)
+
+# Verify log stream exists
+try:
+    response = client.describe_log_streams(
         logGroupName=LOG_GROUP_NAME,
-        logStreamName=LOG_STREAM_NAME
+        logStreamNamePrefix=LOG_STREAM_NAME
     )
-    print(f"Created log stream: {LOG_STREAM_NAME}")
-except client.exceptions.ResourceAlreadyExistsException:
-    print(f"Log stream already exists: {LOG_STREAM_NAME}")
+    log_streams = [ls['logStreamName'] for ls in response.get('logStreams', [])]
+    if LOG_STREAM_NAME not in log_streams:
+        print(f"ERROR: Log stream '{LOG_STREAM_NAME}' does not exist in log group '{LOG_GROUP_NAME}'. "
+              "Please create it before sending test logs.")
+        sys.exit(1)
+    print(f"Log stream exists: {LOG_STREAM_NAME}")
+except Exception as e:
+    print(f"ERROR: Failed to check log stream: {e}")
+    sys.exit(1)
 
 # Generate bulk events matching the Iceberg table schema:
 # id (INT), customer_name (STRING), amount (INT), order_date (DATE)

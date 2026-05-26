@@ -1,0 +1,803 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Consolidated Iceberg data pipeline template. Provisions S3 storage buckets,
+  IAM roles, an AWS Glue job for materialized view ETL, an Amazon Data Firehose
+  delivery stream with Iceberg destination, a Lambda function for CloudWatch Logs
+  processing, SQS dead-letter queues, and a subscription filter. Supports both
+  Lake Formation and non-Lake Formation configurations via the EnableLakeFormation
+  parameter.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "[REQUIRED] Must be reviewed/changed before deploying"
+        Parameters:
+          - CreateScriptBucket
+          - EnableLakeFormation
+          - CreateSubscriptionLogGroup
+          - IcebergDataBucketName
+          - IcebergErrorsBucketName
+          - GlueScriptBucketName
+          - LambdaScriptBucketName
+          - SubscriptionLogGroupName
+      - Label:
+          default: "Safe defaults provided, only change if customizing"
+        Parameters:
+          - DatabaseName
+          - GlueJobRoleName
+          - GlueJobName
+          - WorkerType
+          - NumberOfWorkers
+          - WarehouseDatabaseName
+          - FirehoseStreamName
+          - FirehoseBufferSizeMBs
+          - FirehoseBufferIntervalSeconds
+          - StreamDatabaseName
+          - StreamTableName
+          - LambdaFunctionName
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LambdaFirehoseProcessorRoleName
+          - FirehoseIcebergDeliveryRoleName
+          - GlueJobTriggerFunctionName
+
+Parameters:
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # ── Must be provided at deploy time ────────────────────────────────────────
+  CreateScriptBucket:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >-
+      Set to false if a reusable artifactory bucket already exists in your account.
+      When false, the stack will not create the bucket and will use the existing one.
+
+  EnableLakeFormation:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable Lake Formation integration for the Glue job and S3 bucket policy"
+
+  CreateSubscriptionLogGroup:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Set to true to create the subscription log group, false if it already exists"
+
+  # S3 Buckets (must be globally unique across all AWS accounts)
+  IcebergDataBucketName:
+    Type: String
+    Default: my-company-iceberg-data-bucket
+    Description: >-
+      Name for the S3 bucket that stores Apache Iceberg table data files.
+      Must be globally unique across all AWS accounts and regions.
+      Recommended pattern: {company}-{project}-{bucket-purpose}-{account-id}-{region}
+
+  IcebergErrorsBucketName:
+    Type: String
+    Default: my-company-iceberg-errors-bucket
+    Description: >-
+      Name for the S3 bucket that captures failed records for troubleshooting and replay.
+      Must be globally unique across all AWS accounts.
+
+  GlueScriptBucketName:
+    Type: String
+    Default: my-company-glue-scripts-bucket
+    Description: >-
+      Name for the S3 bucket that stores the Glue ETL script.
+      Must be globally unique across all AWS accounts and regions.
+
+  LambdaScriptBucketName:
+    Type: String
+    Default: my-company-glue-scripts-bucket
+    Description: >-
+      S3 bucket containing the Lambda deployment package.
+      Can reuse the same value as GlueScriptBucketName if storing all artifacts in one bucket.
+
+  SubscriptionLogGroupName:
+    Type: String
+    Default: /aws/application/logs
+    Description: >-
+      CloudWatch Log Group name to subscribe to the Lambda function.
+      Must match an existing or to-be-created log group in your account.
+
+  # ── Safe defaults provided, review if customizing ───────────────────────────
+  DatabaseName:
+    Type: String
+    Default: stream_analytics
+    Description: "Glue Catalog database name for Iceberg tables and materialized views"
+
+  GlueJobRoleName:
+    Type: String
+    Default: my-iceberg-glue-job-role
+    Description: "Name for the IAM role assumed by AWS Glue jobs"
+
+  GlueJobName:
+    Type: String
+    Default: my-iceberg-glue-job
+    Description: "Name for the Glue job displayed in the AWS console"
+
+  WorkerType:
+    Type: String
+    Default: G.1X
+    Description: "Glue worker instance type (G.1X, G.2X, G.4X, etc.)"
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    Description: "Number of Glue workers allocated to the job"
+
+  WarehouseDatabaseName:
+    Type: String
+    Default: stream_analytics
+    Description: "Database name used in the Iceberg warehouse S3 path (s3://bucket/{name}.db)"
+
+  FirehoseStreamName:
+    Type: String
+    Default: iceberg-logs-stream
+    Description: "Name for the Amazon Data Firehose delivery stream"
+
+  FirehoseBufferSizeMBs:
+    Type: Number
+    Default: 5
+    Description: "Firehose buffer size in MBs before delivery"
+
+  FirehoseBufferIntervalSeconds:
+    Type: Number
+    Default: 30
+    Description: "Firehose buffer interval in seconds before delivery"
+
+  StreamDatabaseName:
+    Type: String
+    Default: stream_analytics
+    Description: "Glue Catalog database name for the Firehose Iceberg destination"
+
+  StreamTableName:
+    Type: String
+    Default: application_logs
+    Description: "Glue Catalog table name for the Firehose Iceberg destination"
+
+  LambdaFunctionName:
+    Type: String
+    Default: CloudWatchLogsToIceberg
+    Description: "Name for the Lambda function that processes CloudWatch Logs"
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: "Lambda function timeout in seconds"
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: "Lambda function memory size in MB"
+
+  LambdaFirehoseProcessorRoleName:
+    Type: String
+    Default: LambdaFirehoseProcessorRole
+    Description: "Name for the IAM role used by the Lambda function"
+
+  FirehoseIcebergDeliveryRoleName:
+    Type: String
+    Default: FirehoseIcebergDeliveryRole
+    Description: "Name for the IAM role used by the Firehose delivery stream"
+
+  GlueJobTriggerFunctionName:
+    Type: String
+    Default: iceberg-glue-job-trigger
+    Description: "Name for the Lambda function that triggers and polls the Glue job"
+
+Conditions:
+  LakeFormationEnabled: !Equals [!Ref EnableLakeFormation, "true"]
+  ShouldCreateSubscriptionLogGroup: !Equals [!Ref CreateSubscriptionLogGroup, "true"]
+  ShouldCreateScriptBucket: !Equals [!Ref CreateScriptBucket, "true"]
+
+Resources:
+  # ── S3 Buckets ────────────────────────────────────────────────────────────
+  IcebergDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref IcebergDataBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  IcebergDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IcebergDataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: !If [LakeFormationEnabled, LakeFormationDataAccess, GlueJobAccess]
+            Effect: Allow
+            Principal:
+              AWS: !If
+                - LakeFormationEnabled
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess
+                - !GetAtt GlueJobRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${IcebergDataBucketName}
+              - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
+
+  IcebergErrorsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref IcebergErrorsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  GlueScriptBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateScriptBucket
+    Properties:
+      BucketName: !Ref GlueScriptBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Glue Job IAM Role ───────────────────────────────────────────────────
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref GlueJobRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: glue-access-formv
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetTable
+                  - glue:GetTables
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*
+        - PolicyName: iam-pass-role
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${GlueJobRoleName}
+        - !If
+          - LakeFormationEnabled
+          - PolicyName: lake-formation-access
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lakeformation:GetDataAccess
+                    - lakeformation:GetTemporaryGluePartitionCredentials
+                    - lakeformation:GetTemporaryGlueTableCredentials
+                  Resource: "*"
+          - !Ref AWS::NoValue
+        - PolicyName: iceberg-s3-emr-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${IcebergDataBucketName}
+                  - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
+                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}
+                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}/*
+              - Effect: Allow
+                Action: "elasticmapreduce:*"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:PrincipalAccount: !Sub ${AWS::AccountId}
+        - PolicyName: glue-script-bucket-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${GlueScriptBucketName}/*
+
+  # ── Glue Job ────────────────────────────────────────────────────────────
+  IcebergGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: ArtifactUploaderCustomResource
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.1"
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptBucketName}/scripts/sample-glue-job-iceberg-materializedview-builder.py
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      DefaultArguments:
+        --conf: !Sub
+          - >-
+            spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+            --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+            --conf spark.sql.catalog.glue_catalog.type=glue
+            --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}/${WarehouseDatabaseName}.db
+            --conf spark.sql.catalog.glue_catalog.glue.region=${AWS::Region}
+            --conf spark.sql.catalog.glue_catalog.glue.id=${AWS::AccountId}
+            --conf spark.sql.catalog.glue_catalog.glue.account-id=${AWS::AccountId}
+            --conf spark.sql.catalog.glue_catalog.client.region=${AWS::Region}
+            --conf spark.sql.catalog.glue_catalog.glue.lakeformation-enabled=${LakeFormationValue}
+            --conf spark.sql.defaultCatalog=glue_catalog
+            --conf spark.sql.optimizer.answerQueriesWithMVs.enabled=true
+            --conf spark.sql.materializedViews.metadataCache.enabled=true
+          - LakeFormationValue: !If [LakeFormationEnabled, "true", "false"]
+        --datalake-formats: iceberg
+        --iceberg-data-bucket: !Ref IcebergDataBucketName
+        --warehouse-database-name: !Ref WarehouseDatabaseName
+        --stream-table-name: !Ref StreamTableName
+
+  # ── Glue MV Refresh Job ───────────────────────────────────────────────
+  IcebergGlueMVRefreshJob:
+    Type: AWS::Glue::Job
+    DependsOn: ArtifactUploaderCustomResource
+    Properties:
+      Name: !Sub ${GlueJobName}-mv-refresh
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: "5.1"
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${GlueScriptBucketName}/scripts/glue-job-mv-refresh.py
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      DefaultArguments:
+        --conf: !Sub
+          - >-
+            spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+            --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+            --conf spark.sql.catalog.glue_catalog.type=glue
+            --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}/${WarehouseDatabaseName}.db
+            --conf spark.sql.catalog.glue_catalog.glue.region=${AWS::Region}
+            --conf spark.sql.catalog.glue_catalog.glue.id=${AWS::AccountId}
+            --conf spark.sql.catalog.glue_catalog.glue.account-id=${AWS::AccountId}
+            --conf spark.sql.catalog.glue_catalog.client.region=${AWS::Region}
+            --conf spark.sql.catalog.glue_catalog.glue.lakeformation-enabled=${LakeFormationValue}
+            --conf spark.sql.defaultCatalog=glue_catalog
+            --conf spark.sql.optimizer.answerQueriesWithMVs.enabled=true
+            --conf spark.sql.materializedViews.metadataCache.enabled=true
+          - LakeFormationValue: !If [LakeFormationEnabled, "true", "false"]
+        --datalake-formats: iceberg
+        --iceberg-data-bucket: !Ref IcebergDataBucketName
+        --warehouse-database-name: !Ref WarehouseDatabaseName
+        --stream-table-name: !Ref StreamTableName
+
+  # ── Scheduled MV Refresh Trigger ─────────────────────────────────────────
+  MVRefreshScheduleTrigger:
+    Type: AWS::Glue::Trigger
+    DependsOn: IcebergGlueMVRefreshJob
+    Properties:
+      Name: !Sub ${GlueJobName}-mv-refresh-schedule
+      Type: SCHEDULED
+      Schedule: "cron(0 0 * * ? *)"
+      StartOnCreation: true
+      Actions:
+        - JobName: !Sub ${GlueJobName}-mv-refresh
+
+  # ── Application Log Group (conditional) ─────────────────────────────────
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldCreateSubscriptionLogGroup
+    Properties:
+      LogGroupName: !Ref SubscriptionLogGroupName
+      RetentionInDays: 14
+
+  ApplicationLogStream:
+    Type: AWS::Logs::LogStream
+    Condition: ShouldCreateSubscriptionLogGroup
+    DependsOn: ApplicationLogGroup
+    Properties:
+      LogGroupName: !Ref SubscriptionLogGroupName
+      LogStreamName: test-stream
+
+  # ── Firehose Log Group and Stream ───────────────────────────────────────
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${FirehoseStreamName}
+      RetentionInDays: 14
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    DependsOn: FirehoseLogGroup
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: IcebergDelivery
+
+  # ── IAM Roles ───────────────────────────────────────────────────────────
+  LambdaFirehoseProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaFirehoseProcessorRoleName
+      Description: Allows Lambda to process CloudWatch Logs and write to Firehose
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FirehoseWriteAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !Sub arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}
+        - PolicyName: DLQWriteAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt FailedEventsQueue.Arn
+                  - !GetAtt PermanentFailureQueue.Arn
+
+  FirehoseIcebergDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref FirehoseIcebergDeliveryRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AndGlueAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${IcebergDataBucketName}
+                  - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
+                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}
+                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}/*
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${StreamDatabaseName}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${StreamDatabaseName}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${FirehoseStreamName}:*
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+
+  # ── Glue Job Trigger IAM Role ─────────────────────────────────────────────
+  GlueJobTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueJobAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobName}
+
+  # ── Glue Job Trigger Lambda Function ────────────────────────────────────
+  GlueJobTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref GlueJobTriggerFunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      Role: !GetAtt GlueJobTriggerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          from urllib.request import urlopen, Request
+
+          def send_response(event, context, status, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId']
+              }).encode('utf-8')
+              req = Request(event['ResponseURL'], data=body, method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      send_response(event, context, 'SUCCESS')
+                      return
+                  glue = boto3.client('glue')
+                  job_name = event['ResourceProperties']['GlueJobName']
+                  response = glue.start_job_run(JobName=job_name)
+                  run_id = response['JobRunId']
+                  while True:
+                      time.sleep(30)
+                      result = glue.get_job_run(JobName=job_name, RunId=run_id)
+                      state = result['JobRun']['JobRunState']
+                      if state == 'SUCCEEDED':
+                          send_response(event, context, 'SUCCESS')
+                          return
+                      elif state in ['FAILED', 'ERROR', 'TIMEOUT', 'STOPPED']:
+                          send_response(event, context, 'FAILED', f'Glue job ended with state: {state}')
+                          return
+              except Exception as e:
+                  send_response(event, context, 'FAILED', str(e))
+
+  # ── Glue Job Trigger Custom Resource ──────────────────────────────────────
+  GlueJobTriggerCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: IcebergGlueJob
+    Properties:
+      ServiceToken: !GetAtt GlueJobTriggerFunction.Arn
+      GlueJobName: !Ref GlueJobName
+
+  # ── Artifact Uploader IAM Role ───────────────────────────────────────────
+  ArtifactUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ArtifactUploadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${GlueScriptBucketName}/scripts/*
+                  - !Sub arn:aws:s3:::${LambdaScriptBucketName}/lambda/*
+
+  # ── Artifact Uploader Lambda Function ──────────────────────────────────
+  ArtifactUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt ArtifactUploaderRole.Arn
+      Code:
+        ZipFile: |
+          import json,boto3,base64,zlib,zipfile,io
+          from urllib.request import urlopen,Request
+          def send(event,ctx,status,reason=''):
+              body=json.dumps({'Status':status,'Reason':reason or ctx.log_stream_name,'PhysicalResourceId':ctx.log_stream_name,'StackId':event['StackId'],'RequestId':event['RequestId'],'LogicalResourceId':event['LogicalResourceId']}).encode()
+              urlopen(Request(event['ResponseURL'],data=body,method='PUT',headers={'Content-Type':'','Content-Length':str(len(body))}))
+          def handler(event,context):
+              try:
+                  if event['RequestType']=='Delete':
+                      send(event,context,'SUCCESS');return
+                  p=event['ResourceProperties']
+                  s3=boto3.client('s3')
+                  for k,key in [('GlueScriptEncoded','scripts/sample-glue-job-iceberg-materializedview-builder.py'),('MVRefreshScriptEncoded','scripts/glue-job-mv-refresh.py'),('LambdaScriptEncoded',None)]:
+                      raw=zlib.decompress(base64.b64decode(p[k]))
+                      if key:
+                          s3.put_object(Bucket=p['GlueBucket'],Key=key,Body=raw)
+                      else:
+                          buf=io.BytesIO()
+                          with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as zf:
+                              zf.writestr('lambda_function.py',raw)
+                          buf.seek(0)
+                          s3.put_object(Bucket=p['LambdaBucket'],Key='lambda/lambda_function.zip',Body=buf.read())
+                  send(event,context,'SUCCESS')
+              except Exception as e:
+                  send(event,context,'FAILED',str(e))
+
+
+  # ── Artifact Uploader Custom Resource ────────────────────────────────────
+  ArtifactUploaderCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ArtifactUploaderFunction.Arn
+      GlueBucket: !Ref GlueScriptBucketName
+      LambdaBucket: !Ref LambdaScriptBucketName
+      BucketDependency: !If [ShouldCreateScriptBucket, !Ref GlueScriptBucket, "existing"]
+      GlueScriptEncoded: eNrNWG1zmlgU/s6vOMN+EDqGJNp0d53JB2NIakelA2i3280wV7gatry4XEzqOs70R/QX9pfsuYAEhGja6bZlGMVzz8tzXi9X11+EUQxsxQQ3fYxdn+bPEbHplNjvhVkU+kDu2dxbUmUZux6DjGdOY52y0LujjraI3TBgKfNixRYkeq/YYRDTD/GW3eDEXkora91hvEZaLd/f4XTL8yqcCgKJ5gzOa3BI6JWCq3dNeCe+0i6sUXeoik0QXXSKRvMjh8TkaLq039OYk+9JRG/DJaPJwpTgQ0B8ypdYHFHiHyHVy4g3ssBsNFv0R5KF+QNqXCz4IDEbJTgzx/pAVxKaxShjiFngzp1zv6QCj8zJihu4scSdLThz0wROkQWh1zW7A+0aAMVFLmvZ6IQXzkUhc9fiXlmpu8jE5RQMmiTWrIsyhFGVpRSxnOVdrYYbIY+n5UwtHrSS1cJqFu2EZ9fyY0kpWH9M042Qps1K0lZFUFndtV3NesFqVfpGuMQkXHQNlSeh4r3AV8yLQZKiirQwnEz66htIVmfiusKwsfw7UXjT1dWX2hhNcC7W7hwfr2uivzleV+xvFGcqCovIDWJpJp6fY+22gctAKtOBWk1N2HqFDFWlTcgh4Xr+vAE0IGJdOnQG0TKwWEwXEv9IxJowC+SOwL0VRVH9QO1lTIEAZ1BAJy72A4QBzIjrLSMKcYhL4QLiWwpp//vUcUlMvZWCChJFRc/WuaVNBwyzq5vqZYaIs7KYRLwH+KxT+IeU0uNolYLi1yzIqPyiHlkw6qBMFC4DRypIwlGqrwmtB/5HwfS04euByuFI60zphskFbPSDTRcxqMkXjgQgDGjn2wO56vYHuyg+f/wEa7opoEmjku0CSqLMQoSFyEQ8WYIg5LH7BT5/+og3GGgNTtFlrGTM7rY5s+UfdScY84oUHwGJQ98j/tQhD5FPtzP2j4fR7Olq11TzzoD+FYw0E9Q/+oZpwDobxhtlveXYiDI2QxqeN8SNYYaDBPsvG8eXIwMzFS7InCQ5lwJ6763ATkA5GRcDn6wgoEjgCZcLVZ+kl+t1gzm0T9gB9Q/5TcqHeRRD0T7JERYT2MpjkySvn44ISAYT/Ihk7QN0IG3ZpNheWRYxQ4OnpFBZZxN8A1JJD79cp/irPzKbFRZ7iTPMp1G6Exmm3h9dV7mIj30d71UURg5qcXgI8EJ8aolFLv0aG2gGssleWhlo6GRfG0GjMLePcycbOTPGTa6Uy1lttbQ70A8Y5a+UxF94aUPBT9PotfC+rGj6I0PVTZ4Y7VCVTLqDsWqUpKXTJjS6Hqaj0cSfp2cnyf6qQqN10npxdHKKd0Mup1xqocxFOE0kAFonVZlWRaZdstOukWlXZJ6jTO+WRJ7LpU5rZJ5XZM7K2Gr8OWvIO5VUUzfPOzChkTtbpU39fabLl1ROHcADhWOoA7VnwjO40rXhgVoRZYXdhvdSfXTOOnCJ4xuGE3Bn+IbgMtwMJNujJICIIlIZ/mf36xAccP9S117DEGtB73cH/T/xXSN5wcU5u3fGpu/Bm0fq5EU+/H38iFziuf/ifnjn0nv4XpVRHoI1wXoAOSyCnCDIr9qgqkHcG7qSiq4BaR3u346qm0xPG49M6Zm81eLfWem+Y/P9qcpvjIdSunfJW/44xBOolRJL/E9oiBL/ta6NX8PF2zLmr9mffs3bGCs5+cchwFb6aaZMLbxvMGayygBNv1T1SiALw+dJQfytAyZlMVyNBwOcP7OIstufalgjwBK24eRADHX1SleNl1/aaYmVPbW3A+v3PLuLkMVHT0b3TTNcPDX8FfBzwyvtonAsNca9nmoY3LO320P8njNp8XzJFaXHys7OMfLxI2R6fJy5AfG87ADJ/+yyQ993+R9q/wFy8FbP
+      MVRefreshScriptEncoded: eNq9Vdtu2zgQfddXDNgXaeEo3eybAT8ojtKmsNeF5Lhou4ZAS5SjjW5LUklcQ0A/ol/YL+lQNyuWs33ZrSHY8vBw5syZGTJK8oxLEDuhRfWrjBLWvXPqsw3177WQZwnQR7GNC2YWMooFNJgtkw4TWfzAgkUuoywVNTjfiZzye9PPUsmeZAt3lXFa2557PQK+QdtJ3N/ZpsW8yzaaRvlWwOQEDx2zMnH1YQSfybvFpfenNbfJCEiESTG+PQuopGebwr9nUpkfKWd3WSFYtbCh+JLShKklITmjyRla48a4NjThY9h+PrqhbQ+scbGXgy583KHAiuvBblY2TzAhkLOmkpuovPQexlBmM0ojqatke8msR6AshqZNraU1W7wBwO1E7fV8TCLOtkRr0vVUVl6dLoLUPhNF08mJdWJAxoeQZ4p1kM8nPay1Tk8v2HhKtGdRe6uN2hXmOPJLRelFf8nTWqvL5lVlGzIYrB7HHla9F3W4e61dYREuLddWRRhkr81Xqxv7A1QlCsl+4KD0kgeifbAc++3iFp0olPhjfH6+P6Fveb4fRCjNYEO0nEep1EMymUxgvgKHhZyJO9VT8P3rN2g5jmHfvpYjBOL/miD+6zigsXsvAT0SbDUtYCHwIvWEZLmuvqroIwhTY6yp/Agh9hPzC8mAggKY4NAIexyyFEIaxQVnIDNcynKQdwzqmU5YEFHJ4p2JDipH/Vz2XaRyDO7Scpb2VUNJQYWkXPW1Or9M9aXXdsl3NSn1CdPGqj4sprlgAe7hWZEGem8nnNX+RnBxwL9IZrqYv5/Zio6+b5yWwuhxY08+yyXY1Q+OOVABbPzfE7m2bmbHLFTN96zssalVaU52s3LmIcOeMlwVCwvdafcKvn/7ig+4GA1+H3ddlWC9eETj6Avyf4jYYwP8/56KT9d9pCV0fTubAW9YzVd4aMc02QT0oHJ9HYl/YlTOsa8d230Lc2tpOzfW7OYTylZN5745SEvzMB5mOxlVFGI0jaWqJGKGLC5e41gMdboYwwrVCXctMdQIJ7K66FIp4BcqdJrKT1Ry7Zk9XcJvcO0s5j9RZuFc2Q5cfgS/wKlOGG9OVFPcZY+60ehTdy75K20Pp6YOeKH1psi9nU5t11Vif2wPnX8ZoeMDr+ezHojx0QC83Px144dRSuO4aX119fpZkkTqev8B9Xc3Kw==
+      LambdaScriptEncoded: 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
+  # ── Firehose Delivery Stream ────────────────────────────────────────────
+  IcebergFirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - FirehoseIcebergDeliveryRole
+      - FirehoseLogStream
+      - GlueJobTriggerCustomResource
+    Properties:
+      DeliveryStreamName: !Ref FirehoseStreamName
+      DeliveryStreamType: DirectPut
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseIcebergDeliveryRole.Arn
+        CatalogConfiguration:
+          CatalogARN: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+        DestinationTableConfigurationList:
+          - DestinationDatabaseName: !Ref StreamDatabaseName
+            DestinationTableName: !Ref StreamTableName
+        BufferingHints:
+          SizeInMBs: !Ref FirehoseBufferSizeMBs
+          IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseIcebergDeliveryRole.Arn
+          BucketARN: !Sub arn:aws:s3:::${IcebergDataBucketName}
+          Prefix: !Sub ${StreamTableName}/data/
+          ErrorOutputPrefix: !Sub ${StreamTableName}/errors/
+          CompressionFormat: UNCOMPRESSED
+        ProcessingConfiguration:
+          Enabled: false
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: IcebergDelivery
+        RetryOptions:
+          DurationInSeconds: 3600
+
+  # ── Dead Letter Queue for Failed Lambda Invocations ──────────────────────
+  PermanentFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${LambdaFunctionName}-permanent-failures
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  FailedEventsQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: PermanentFailureQueue
+    Properties:
+      QueueName: !Sub ${LambdaFunctionName}-failed-events
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 300
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PermanentFailureQueue.Arn
+        maxReceiveCount: 3
+
+  # ── Lambda Function ─────────────────────────────────────────────────────
+  CloudWatchLogsToIcebergFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaFirehoseProcessorRole
+      - FailedEventsQueue
+      - ArtifactUploaderCustomResource
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaFirehoseProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: Processes CloudWatch Logs and sends to Firehose for Iceberg delivery
+      DeadLetterConfig:
+        TargetArn: !GetAtt FailedEventsQueue.Arn
+      Environment:
+        Variables:
+          FIREHOSE_STREAM_NAME: !Ref FirehoseStreamName
+      Code:
+        S3Bucket: !Ref LambdaScriptBucketName
+        S3Key: lambda/lambda_function.zip
+
+  # ── Subscription Filter ─────────────────────────────────────────────────
+  CloudWatchLogsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldCreateSubscriptionLogGroup
+    Properties:
+      FunctionName: !GetAtt CloudWatchLogsToIcebergFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${SubscriptionLogGroupName}:*
+
+  IcebergStreamingSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: ShouldCreateSubscriptionLogGroup
+    DependsOn:
+      - CloudWatchLogsInvokePermission
+    Properties:
+      LogGroupName: !Ref SubscriptionLogGroupName
+      FilterName: IcebergStreamingFilter
+      FilterPattern: ""
+      DestinationArn: !GetAtt CloudWatchLogsToIcebergFunction.Arn
+
+  # ── DLQ Reprocessing ────────────────────────────────────────────────────
+  DLQEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt FailedEventsQueue.Arn
+      FunctionName: !GetAtt CloudWatchLogsToIcebergFunction.Arn
+      BatchSize: 5
+      Enabled: true

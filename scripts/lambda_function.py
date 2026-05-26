@@ -69,65 +69,93 @@ def send_to_firehose(records: List[Dict[str, Any]]) -> Dict[str, int]:
     return {'success': success_count, 'failed': failed_count}
 
 
+def process_cloudwatch_logs(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Process a CloudWatch Logs event."""
+    compressed_payload = base64.b64decode(event['awslogs']['data'])
+    uncompressed_payload = gzip.decompress(compressed_payload)
+    log_data = json.loads(uncompressed_payload)
+
+    log_group = log_data.get('logGroup', '')
+    log_stream = log_data.get('logStream', '')
+    log_events = log_data.get('logEvents', [])
+
+    print(
+        f"Processing {len(log_events)} log events "
+        f"from {log_group}/{log_stream}"
+    )
+
+    records = []
+    skipped = 0
+    for log_event in log_events:
+        parsed = parse_log_message(log_event.get('message', ''))
+        if parsed and 'id' in parsed:
+            records.append({
+                'id': parsed['id'],
+                'customer_name': parsed.get('customer_name', ''),
+                'amount': parsed.get('amount', 0),
+                'order_date': parsed.get('order_date', ''),
+            })
+        else:
+            skipped += 1
+
+    if skipped > 0:
+        print(f"Skipped {skipped} non-matching log events")
+
+    result = send_to_firehose(records)
+
+    return {
+        'processed': len(log_events),
+        'forwarded': result['success'],
+        'failed': result['failed'],
+        'skipped': skipped,
+    }
+
+
+def process_sqs_records(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Reprocess failed events from the DLQ (SQS trigger)."""
+    sqs_records = event.get('Records', [])
+    print(f"Reprocessing {len(sqs_records)} events from DLQ")
+
+    total_forwarded = 0
+    total_failed = 0
+
+    for sqs_record in sqs_records:
+        try:
+            # The SQS message body contains the original CloudWatch Logs event
+            original_event = json.loads(sqs_record['body'])
+            result = process_cloudwatch_logs(original_event)
+            total_forwarded += result['forwarded']
+            total_failed += result['failed']
+        except Exception as e:
+            print(f"Error reprocessing DLQ record: {str(e)}")
+            total_failed += 1
+
+    return {
+        'reprocessed': len(sqs_records),
+        'forwarded': total_forwarded,
+        'failed': total_failed,
+    }
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Main Lambda handler function.
 
-    Processes CloudWatch Logs events and forwards records to Firehose.
-    Expects log messages with: id, customer_name, amount, order_date
+    Handles two event sources:
+    - CloudWatch Logs (subscription filter): event contains 'awslogs' key
+    - SQS (DLQ reprocessing): event contains 'Records' key
     """
     try:
-        # Decode and decompress the CloudWatch Logs data
-        compressed_payload = base64.b64decode(event['awslogs']['data'])
-        uncompressed_payload = gzip.decompress(compressed_payload)
-        log_data = json.loads(uncompressed_payload)
+        if 'awslogs' in event:
+            result = process_cloudwatch_logs(event)
+        elif 'Records' in event:
+            result = process_sqs_records(event)
+        else:
+            print(f"Unknown event format: {json.dumps(event)[:200]}")
+            return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown event format'})}
 
-        # Extract metadata
-        log_group = log_data.get('logGroup', '')
-        log_stream = log_data.get('logStream', '')
-        log_events = log_data.get('logEvents', [])
-
-        print(
-            f"Processing {len(log_events)} log events "
-            f"from {log_group}/{log_stream}"
-        )
-
-        # Parse and forward records matching the Iceberg schema
-        records = []
-        skipped = 0
-        for log_event in log_events:
-            parsed = parse_log_message(log_event.get('message', ''))
-            if parsed and 'id' in parsed:
-                # Forward only the Iceberg table columns
-                records.append({
-                    'id': parsed['id'],
-                    'customer_name': parsed.get('customer_name', ''),
-                    'amount': parsed.get('amount', 0),
-                    'order_date': parsed.get('order_date', ''),
-                })
-            else:
-                skipped += 1
-
-        if skipped > 0:
-            print(f"Skipped {skipped} non-matching log events")
-
-        # Send to Firehose
-        result = send_to_firehose(records)
-
-        print(
-            f"Processing complete. "
-            f"Forwarded: {result['success']}, Failed: {result['failed']}"
-        )
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'processed': len(log_events),
-                'forwarded': result['success'],
-                'failed': result['failed'],
-                'skipped': skipped,
-            }),
-        }
+        print(f"Processing complete: {result}")
+        return {'statusCode': 200, 'body': json.dumps(result)}
 
     except Exception as e:
         print(f"Error in lambda_handler: {str(e)}")
-        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+        raise  # Re-raise so the event goes to DLQ

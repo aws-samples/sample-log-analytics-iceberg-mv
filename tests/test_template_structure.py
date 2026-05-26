@@ -43,7 +43,7 @@ EXPECTED_PARAMS = {
     "DatabaseName": {
         "type": "String",
         "has_default": True,
-        "default": "iceberg_mv_test2",
+        "default": "stream_analytics",
         "description_contains": "database",
     },
     "IcebergDataBucketName": {

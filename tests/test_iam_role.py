@@ -351,24 +351,35 @@ class TestIcebergS3EmrPolicy:
     # -- S3 statement --
 
     def test_s3_statement_actions(self, template):
-        """The S3 statement must grant s3:GetObject and s3:PutObject."""
+        """The S3 statement must grant s3:GetObject, s3:PutObject, s3:DeleteObject, and s3:ListBucket."""
         stmts = _get_policy_statements(template, self.POLICY_NAME)
         s3_stmt = stmts[0]
         actions = s3_stmt["Action"]
         if not isinstance(actions, list):
             actions = [actions]
         actions = [str(a) for a in actions]
-        assert sorted(actions) == sorted(["s3:GetObject", "s3:PutObject"]), (
-            f"S3 statement actions should be ['s3:GetObject', 's3:PutObject'], got {actions}"
+        assert sorted(actions) == sorted(["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]), (
+            f"S3 statement actions should be ['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket'], got {actions}"
         )
 
     def test_s3_statement_resource(self, template):
-        """The S3 statement resource must be arn:aws:s3:::*."""
+        """The S3 statement resource must reference specific bucket ARNs."""
         stmts = _get_policy_statements(template, self.POLICY_NAME)
         s3_stmt = stmts[0]
         resource = s3_stmt["Resource"]
-        assert str(resource) == "arn:aws:s3:::*", (
-            f"S3 resource should be 'arn:aws:s3:::*', got '{resource}'"
+        if not isinstance(resource, list):
+            resource = [resource]
+        resource_strs = [str(r) for r in resource]
+        # Should have 4 ARNs: bucket and bucket/* for both data and errors buckets
+        assert len(resource_strs) == 4, (
+            f"S3 resource should have 4 ARN entries, got {len(resource_strs)}"
+        )
+        # Verify the ARN patterns reference the bucket name parameters
+        assert any("IcebergDataBucketName" in r for r in resource_strs), (
+            "S3 resource should reference IcebergDataBucketName"
+        )
+        assert any("IcebergErrorsBucketName" in r for r in resource_strs), (
+            "S3 resource should reference IcebergErrorsBucketName"
         )
 
     # -- EMR statement --

@@ -6,7 +6,7 @@ from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "iceberg-data-bucket", "warehouse-database-name"])
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "iceberg-data-bucket", "warehouse-database-name", "stream-table-name"])
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
@@ -16,9 +16,10 @@ job.init(args["JOB_NAME"], args)
 CATALOG   = "glue_catalog"
 iceberg_data_bucket = args.get("iceberg_data_bucket") or args.get("iceberg-data-bucket") or args["iceberg_data_bucket"]
 warehouse_db_name = args.get("warehouse_database_name") or args.get("warehouse-database-name") or args["warehouse_database_name"]
+stream_table_name = args.get("stream_table_name") or args.get("stream-table-name") or args["stream_table_name"]
 DATABASE  = warehouse_db_name
-BASETBL   = "application_logs"
-MVVIEW    = "application_logs_mv"
+BASETBL   = stream_table_name
+MVVIEW    = f"{stream_table_name}_mv"
 WAREHOUSE = f"s3://{iceberg_data_bucket}/{warehouse_db_name}.db"
 print(f"=== S3 data bucket: {iceberg_data_bucket}, DATABASE: {warehouse_db_name}, WAREHOUSE: {WAREHOUSE} ===")
 
@@ -42,6 +43,10 @@ try:
     run_step("Step 1: Create database", lambda:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {CATALOG}.{DATABASE}"))
 
+    # Wait for S3 bucket DNS propagation (newly created buckets may need time)
+    print("=== Waiting 30s for S3 bucket DNS propagation ===")
+    time.sleep(30)
+
     # ── Step 2: Create base Iceberg table ────────────────────────────────
     run_step("Step 2: Create base Iceberg table", lambda:
         spark.sql(f"""
@@ -54,7 +59,7 @@ try:
             USING iceberg
             LOCATION '{WAREHOUSE}/{BASETBL}'
         """))
-    time.sleep(10)
+    time.sleep(5)
 
     # ── Step 3: Insert sample data ───────────────────────────────────────
     run_step("Step 3: Insert sample data", lambda:
@@ -76,7 +81,7 @@ try:
         spark.sql(f"DROP MATERIALIZED VIEW IF EXISTS {CATALOG}.{DATABASE}.{MVVIEW}"))
 
     # ── Step 6: Create materialized view ─────────────────────────────────
-    time.sleep(30)
+    time.sleep(5)
     run_step("Step 6: Create Materialized View", lambda:
         spark.sql(f"""
             CREATE MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW}
@@ -87,17 +92,17 @@ try:
             FROM {CATALOG}.{DATABASE}.{BASETBL}
             GROUP BY customer_name
         """))
-    time.sleep(20)
+    time.sleep(5)
 
     # ── Step 7: Verify MV contents ───────────────────────────────────────
     run_step("Step 7: Verify MV contents", lambda:
         spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
-    time.sleep(20)
+    time.sleep(5)
 
     # ── Step 8: Test FULL refresh ────────────────────────────────────────
     run_step("Step 8: FULL refresh MV", lambda:
         spark.sql(f"REFRESH MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW} FULL"))
-    time.sleep(20)
+    time.sleep(5)
 
     run_step("Step 9: Verify post-refresh MV", lambda:
         spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
