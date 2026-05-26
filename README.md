@@ -56,6 +56,10 @@ Application → CloudWatch Logs → Lambda → Firehose → Apache Iceberg (S3 +
 
 ## Deployment
 
+### Launch Stack
+
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/new?stackName=iceberg-pipeline&templateURL=https://raw.githubusercontent.com/aws-samples/sample-log-analytics-iceberg-mv/main/cloudformation/iceberg-pipeline.yaml)
+
 ### Step 1: Deploy the pipeline stack
 
 Deploy the entire solution with a single CloudFormation stack. The template automatically creates S3 buckets, uploads all scripts, provisions IAM roles, configures Firehose, and runs the Glue job to create the Iceberg table and materialized view.
