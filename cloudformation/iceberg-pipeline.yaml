@@ -6,7 +6,7 @@ Description: >-
   delivery stream with Iceberg destination, a Lambda function for CloudWatch Logs
   processing, SQS dead-letter queues, and a subscription filter. Supports both
   Lake Formation and non-Lake Formation configurations via the EnableLakeFormation
-  parameter.
+  parameter .
 
 Metadata:
   AWS::CloudFormation::Interface:
