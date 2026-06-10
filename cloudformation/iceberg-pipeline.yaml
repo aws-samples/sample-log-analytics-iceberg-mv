@@ -25,6 +25,7 @@ Metadata:
       - Label:
           default: "Safe defaults provided, only change if customizing"
         Parameters:
+          - ResourceSuffix
           - DatabaseName
           - GlueJobRoleName
           - GlueJobName
@@ -196,17 +197,75 @@ Parameters:
     Default: iceberg-glue-job-trigger
     Description: "Name for the Lambda function that triggers and polls the Glue job"
 
+  ResourceSuffix:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional custom suffix for resource names (e.g. 'prod', 'teamalpha').
+      Leave blank to auto-generate a timestamp at deploy time.
+      Use only lowercase letters and numbers (no hyphens or underscores)
+      to ensure compatibility with both S3 bucket names and Glue database identifiers.
+
 Conditions:
   LakeFormationEnabled: !Equals [!Ref EnableLakeFormation, "true"]
+  UseCustomSuffix: !Not [!Equals [!Ref ResourceSuffix, ""]]
   ShouldCreateSubscriptionLogGroup: !Equals [!Ref CreateSubscriptionLogGroup, "true"]
   ShouldCreateScriptBucket: !Equals [!Ref CreateScriptBucket, "true"]
 
 Resources:
+  # ── Timestamp Generator ───────────────────────────────────────────────────
+  TimestampGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TimestampGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt TimestampGeneratorRole.Arn
+      Code:
+        ZipFile: |
+          import json, datetime
+          from urllib.request import urlopen, Request
+          def handler(event, context):
+              if event['RequestType'] in ('Update', 'Delete'):
+                  ts = event.get('PhysicalResourceId', datetime.datetime.now().strftime('%Y%m%d%H%M%S'))
+              else:
+                  ts = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+              body = json.dumps({
+                  'Status': 'SUCCESS',
+                  'PhysicalResourceId': ts,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': {'Value': ts}
+              }).encode()
+              urlopen(Request(event['ResponseURL'], data=body, method='PUT',
+                  headers={'Content-Type': '', 'Content-Length': str(len(body))}))
+
+  TimestampResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TimestampGeneratorFunction.Arn
+
   # ── S3 Buckets ────────────────────────────────────────────────────────────
   IcebergDataBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref IcebergDataBucketName
+      BucketName: !Sub
+        - ${IcebergDataBucketName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -233,13 +292,19 @@ Resources:
               - s3:DeleteObject
               - s3:ListBucket
             Resource:
-              - !Sub arn:aws:s3:::${IcebergDataBucketName}
-              - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
+              - !Sub
+                - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+              - !Sub
+                - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}/*
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   IcebergErrorsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref IcebergErrorsBucketName
+      BucketName: !Sub
+        - ${IcebergErrorsBucketName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -250,7 +315,9 @@ Resources:
     Type: AWS::S3::Bucket
     Condition: ShouldCreateScriptBucket
     Properties:
-      BucketName: !Ref GlueScriptBucketName
+      BucketName: !Sub
+        - ${GlueScriptBucketName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -261,7 +328,9 @@ Resources:
   GlueJobRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Ref GlueJobRoleName
+      RoleName: !Sub
+        - ${GlueJobRoleName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -284,8 +353,12 @@ Resources:
                   - glue:GetTables
                 Resource:
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
-                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}
-                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*
+                  - !Sub
+                    - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}_${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}_${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         - PolicyName: iam-pass-role
           PolicyDocument:
             Version: "2012-10-17"
@@ -293,7 +366,9 @@ Resources:
               - Effect: Allow
                 Action: iam:PassRole
                 Resource:
-                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${GlueJobRoleName}
+                  - !Sub
+                    - arn:aws:iam::${AWS::AccountId}:role/${GlueJobRoleName}-${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         - !If
           - LakeFormationEnabled
           - PolicyName: lake-formation-access
@@ -318,10 +393,18 @@ Resources:
                   - s3:DeleteObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub arn:aws:s3:::${IcebergDataBucketName}
-                  - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
-                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}
-                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}/*
+                  - !Sub
+                    - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
               - Effect: Allow
                 Action: "elasticmapreduce:*"
                 Resource: "*"
@@ -336,19 +419,25 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource:
-                  - !Sub arn:aws:s3:::${GlueScriptBucketName}/*
+                  - !Sub
+                    - arn:aws:s3:::${GlueScriptBucketName}-${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   # ── Glue Job ────────────────────────────────────────────────────────────
   IcebergGlueJob:
     Type: AWS::Glue::Job
     DependsOn: ArtifactUploaderCustomResource
     Properties:
-      Name: !Ref GlueJobName
+      Name: !Sub
+        - ${GlueJobName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Role: !GetAtt GlueJobRole.Arn
       GlueVersion: "5.1"
       Command:
         Name: glueetl
-        ScriptLocation: !Sub s3://${GlueScriptBucketName}/scripts/sample-glue-job-iceberg-materializedview-builder.py
+        ScriptLocation: !Sub
+          - s3://${GlueScriptBucketName}-${Timestamp}/scripts/sample-glue-job-iceberg-materializedview-builder.py
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       WorkerType: !Ref WorkerType
       NumberOfWorkers: !Ref NumberOfWorkers
       DefaultArguments:
@@ -357,7 +446,7 @@ Resources:
             spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
             --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
             --conf spark.sql.catalog.glue_catalog.type=glue
-            --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}/${WarehouseDatabaseName}.db
+            --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}-${Timestamp}/${WarehouseDatabaseName}_${Timestamp}.db
             --conf spark.sql.catalog.glue_catalog.glue.region=${AWS::Region}
             --conf spark.sql.catalog.glue_catalog.glue.id=${AWS::AccountId}
             --conf spark.sql.catalog.glue_catalog.glue.account-id=${AWS::AccountId}
@@ -367,9 +456,14 @@ Resources:
             --conf spark.sql.optimizer.answerQueriesWithMVs.enabled=true
             --conf spark.sql.materializedViews.metadataCache.enabled=true
           - LakeFormationValue: !If [LakeFormationEnabled, "true", "false"]
+            Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         --datalake-formats: iceberg
-        --iceberg-data-bucket: !Ref IcebergDataBucketName
-        --warehouse-database-name: !Ref WarehouseDatabaseName
+        --iceberg-data-bucket: !Sub
+          - ${IcebergDataBucketName}-${Timestamp}
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+        --warehouse-database-name: !Sub
+          - ${WarehouseDatabaseName}_${Timestamp}
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         --stream-table-name: !Ref StreamTableName
 
   # ── Glue MV Refresh Job ───────────────────────────────────────────────
@@ -377,12 +471,16 @@ Resources:
     Type: AWS::Glue::Job
     DependsOn: ArtifactUploaderCustomResource
     Properties:
-      Name: !Sub ${GlueJobName}-mv-refresh
+      Name: !Sub
+        - ${GlueJobName}-mv-refresh-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Role: !GetAtt GlueJobRole.Arn
       GlueVersion: "5.1"
       Command:
         Name: glueetl
-        ScriptLocation: !Sub s3://${GlueScriptBucketName}/scripts/glue-job-mv-refresh.py
+        ScriptLocation: !Sub
+          - s3://${GlueScriptBucketName}-${Timestamp}/scripts/glue-job-mv-refresh.py
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       WorkerType: !Ref WorkerType
       NumberOfWorkers: !Ref NumberOfWorkers
       DefaultArguments:
@@ -391,7 +489,7 @@ Resources:
             spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
             --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
             --conf spark.sql.catalog.glue_catalog.type=glue
-            --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}/${WarehouseDatabaseName}.db
+            --conf spark.sql.catalog.glue_catalog.warehouse=s3://${IcebergDataBucketName}-${Timestamp}/${WarehouseDatabaseName}_${Timestamp}.db
             --conf spark.sql.catalog.glue_catalog.glue.region=${AWS::Region}
             --conf spark.sql.catalog.glue_catalog.glue.id=${AWS::AccountId}
             --conf spark.sql.catalog.glue_catalog.glue.account-id=${AWS::AccountId}
@@ -401,9 +499,14 @@ Resources:
             --conf spark.sql.optimizer.answerQueriesWithMVs.enabled=true
             --conf spark.sql.materializedViews.metadataCache.enabled=true
           - LakeFormationValue: !If [LakeFormationEnabled, "true", "false"]
+            Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         --datalake-formats: iceberg
-        --iceberg-data-bucket: !Ref IcebergDataBucketName
-        --warehouse-database-name: !Ref WarehouseDatabaseName
+        --iceberg-data-bucket: !Sub
+          - ${IcebergDataBucketName}-${Timestamp}
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+        --warehouse-database-name: !Sub
+          - ${WarehouseDatabaseName}_${Timestamp}
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         --stream-table-name: !Ref StreamTableName
 
   # ── Scheduled MV Refresh Trigger ─────────────────────────────────────────
@@ -411,12 +514,16 @@ Resources:
     Type: AWS::Glue::Trigger
     DependsOn: IcebergGlueMVRefreshJob
     Properties:
-      Name: !Sub ${GlueJobName}-mv-refresh-schedule
+      Name: !Sub
+        - ${GlueJobName}-mv-refresh-schedule-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Type: SCHEDULED
       Schedule: "cron(0 0 * * ? *)"
       StartOnCreation: true
       Actions:
-        - JobName: !Sub ${GlueJobName}-mv-refresh
+        - JobName: !Sub
+            - ${GlueJobName}-mv-refresh-${Timestamp}
+            - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   # ── Application Log Group (conditional) ─────────────────────────────────
   ApplicationLogGroup:
@@ -438,7 +545,9 @@ Resources:
   FirehoseLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /aws/kinesisfirehose/${FirehoseStreamName}
+      LogGroupName: !Sub
+        - /aws/kinesisfirehose/${FirehoseStreamName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       RetentionInDays: 14
 
   FirehoseLogStream:
@@ -452,7 +561,9 @@ Resources:
   LambdaFirehoseProcessorRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Ref LambdaFirehoseProcessorRoleName
+      RoleName: !Sub
+        - ${LambdaFirehoseProcessorRoleName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Description: Allows Lambda to process CloudWatch Logs and write to Firehose
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -472,7 +583,9 @@ Resources:
                 Action:
                   - firehose:PutRecord
                   - firehose:PutRecordBatch
-                Resource: !Sub arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}
+                Resource: !Sub
+                  - arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${FirehoseStreamName}-${Timestamp}
+                  - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         - PolicyName: DLQWriteAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -490,7 +603,9 @@ Resources:
   FirehoseIcebergDeliveryRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Ref FirehoseIcebergDeliveryRoleName
+      RoleName: !Sub
+        - ${FirehoseIcebergDeliveryRoleName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -509,10 +624,18 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub arn:aws:s3:::${IcebergDataBucketName}
-                  - !Sub arn:aws:s3:::${IcebergDataBucketName}/*
-                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}
-                  - !Sub arn:aws:s3:::${IcebergErrorsBucketName}/*
+                  - !Sub
+                    - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
               - Effect: Allow
                 Action:
                   - glue:GetTable
@@ -523,14 +646,20 @@ Resources:
                   - glue:UpdateTable
                 Resource:
                   - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
-                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${StreamDatabaseName}
-                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${StreamDatabaseName}/*
+                  - !Sub
+                    - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${StreamDatabaseName}_${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${StreamDatabaseName}_${Timestamp}/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${FirehoseStreamName}:*
+                Resource: !Sub
+                  - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${FirehoseStreamName}-${Timestamp}:*
+                  - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
               - Effect: Allow
                 Action:
                   - lakeformation:GetDataAccess
@@ -559,13 +688,17 @@ Resources:
                   - glue:StartJobRun
                   - glue:GetJobRun
                 Resource:
-                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobName}
+                  - !Sub
+                    - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobName}-${Timestamp}
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   # ── Glue Job Trigger Lambda Function ────────────────────────────────────
   GlueJobTriggerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Ref GlueJobTriggerFunctionName
+      FunctionName: !Sub
+        - ${GlueJobTriggerFunctionName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Runtime: python3.12
       Handler: index.handler
       Timeout: 900
@@ -619,7 +752,9 @@ Resources:
     DependsOn: IcebergGlueJob
     Properties:
       ServiceToken: !GetAtt GlueJobTriggerFunction.Arn
-      GlueJobName: !Ref GlueJobName
+      GlueJobName: !Sub
+        - ${GlueJobName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   # ── Artifact Uploader IAM Role ───────────────────────────────────────────
   ArtifactUploaderRole:
@@ -643,8 +778,12 @@ Resources:
                 Action:
                   - s3:PutObject
                 Resource:
-                  - !Sub arn:aws:s3:::${GlueScriptBucketName}/scripts/*
-                  - !Sub arn:aws:s3:::${LambdaScriptBucketName}/lambda/*
+                  - !Sub
+                    - arn:aws:s3:::${GlueScriptBucketName}-${Timestamp}/scripts/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                  - !Sub
+                    - arn:aws:s3:::${LambdaScriptBucketName}-${Timestamp}/lambda/*
+                    - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   # ── Artifact Uploader Lambda Function ──────────────────────────────────
   ArtifactUploaderFunction:
@@ -687,8 +826,12 @@ Resources:
     Type: AWS::CloudFormation::CustomResource
     Properties:
       ServiceToken: !GetAtt ArtifactUploaderFunction.Arn
-      GlueBucket: !Ref GlueScriptBucketName
-      LambdaBucket: !Ref LambdaScriptBucketName
+      GlueBucket: !Sub
+        - ${GlueScriptBucketName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+      LambdaBucket: !Sub
+        - ${LambdaScriptBucketName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       BucketDependency: !If [ShouldCreateScriptBucket, !Ref GlueScriptBucket, "existing"]
       GlueScriptEncoded: eNrNWG1zmlgU/s6vOMN+EDqGJNp0d53JB2NIakelA2i3280wV7gatry4XEzqOs70R/QX9pfsuYAEhGja6bZlGMVzz8tzXi9X11+EUQxsxQQ3fYxdn+bPEbHplNjvhVkU+kDu2dxbUmUZux6DjGdOY52y0LujjraI3TBgKfNixRYkeq/YYRDTD/GW3eDEXkora91hvEZaLd/f4XTL8yqcCgKJ5gzOa3BI6JWCq3dNeCe+0i6sUXeoik0QXXSKRvMjh8TkaLq039OYk+9JRG/DJaPJwpTgQ0B8ypdYHFHiHyHVy4g3ssBsNFv0R5KF+QNqXCz4IDEbJTgzx/pAVxKaxShjiFngzp1zv6QCj8zJihu4scSdLThz0wROkQWh1zW7A+0aAMVFLmvZ6IQXzkUhc9fiXlmpu8jE5RQMmiTWrIsyhFGVpRSxnOVdrYYbIY+n5UwtHrSS1cJqFu2EZ9fyY0kpWH9M042Qps1K0lZFUFndtV3NesFqVfpGuMQkXHQNlSeh4r3AV8yLQZKiirQwnEz66htIVmfiusKwsfw7UXjT1dWX2hhNcC7W7hwfr2uivzleV+xvFGcqCovIDWJpJp6fY+22gctAKtOBWk1N2HqFDFWlTcgh4Xr+vAE0IGJdOnQG0TKwWEwXEv9IxJowC+SOwL0VRVH9QO1lTIEAZ1BAJy72A4QBzIjrLSMKcYhL4QLiWwpp//vUcUlMvZWCChJFRc/WuaVNBwyzq5vqZYaIs7KYRLwH+KxT+IeU0uNolYLi1yzIqPyiHlkw6qBMFC4DRypIwlGqrwmtB/5HwfS04euByuFI60zphskFbPSDTRcxqMkXjgQgDGjn2wO56vYHuyg+f/wEa7opoEmjku0CSqLMQoSFyEQ8WYIg5LH7BT5/+og3GGgNTtFlrGTM7rY5s+UfdScY84oUHwGJQ98j/tQhD5FPtzP2j4fR7Olq11TzzoD+FYw0E9Q/+oZpwDobxhtlveXYiDI2QxqeN8SNYYaDBPsvG8eXIwMzFS7InCQ5lwJ6763ATkA5GRcDn6wgoEjgCZcLVZ+kl+t1gzm0T9gB9Q/5TcqHeRRD0T7JERYT2MpjkySvn44ISAYT/Ihk7QN0IG3ZpNheWRYxQ4OnpFBZZxN8A1JJD79cp/irPzKbFRZ7iTPMp1G6Exmm3h9dV7mIj30d71UURg5qcXgI8EJ8aolFLv0aG2gGssleWhlo6GRfG0GjMLePcycbOTPGTa6Uy1lttbQ70A8Y5a+UxF94aUPBT9PotfC+rGj6I0PVTZ4Y7VCVTLqDsWqUpKXTJjS6Hqaj0cSfp2cnyf6qQqN10npxdHKKd0Mup1xqocxFOE0kAFonVZlWRaZdstOukWlXZJ6jTO+WRJ7LpU5rZJ5XZM7K2Gr8OWvIO5VUUzfPOzChkTtbpU39fabLl1ROHcADhWOoA7VnwjO40rXhgVoRZYXdhvdSfXTOOnCJ4xuGE3Bn+IbgMtwMJNujJICIIlIZ/mf36xAccP9S117DEGtB73cH/T/xXSN5wcU5u3fGpu/Bm0fq5EU+/H38iFziuf/ifnjn0nv4XpVRHoI1wXoAOSyCnCDIr9qgqkHcG7qSiq4BaR3u346qm0xPG49M6Zm81eLfWem+Y/P9qcpvjIdSunfJW/44xBOolRJL/E9oiBL/ta6NX8PF2zLmr9mffs3bGCs5+cchwFb6aaZMLbxvMGayygBNv1T1SiALw+dJQfytAyZlMVyNBwOcP7OIstufalgjwBK24eRADHX1SleNl1/aaYmVPbW3A+v3PLuLkMVHT0b3TTNcPDX8FfBzwyvtonAsNca9nmoY3LO320P8njNp8XzJFaXHys7OMfLxI2R6fJy5AfG87ADJ/+yyQ993+R9q/wFy8FbP
       MVRefreshScriptEncoded: eNq9Vdtu2zgQfddXDNgXaeEo3eybAT8ojtKmsNeF5Lhou4ZAS5SjjW5LUklcQ0A/ol/YL+lQNyuWs33ZrSHY8vBw5syZGTJK8oxLEDuhRfWrjBLWvXPqsw3177WQZwnQR7GNC2YWMooFNJgtkw4TWfzAgkUuoywVNTjfiZzye9PPUsmeZAt3lXFa2557PQK+QdtJ3N/ZpsW8yzaaRvlWwOQEDx2zMnH1YQSfybvFpfenNbfJCEiESTG+PQuopGebwr9nUpkfKWd3WSFYtbCh+JLShKklITmjyRla48a4NjThY9h+PrqhbQ+scbGXgy583KHAiuvBblY2TzAhkLOmkpuovPQexlBmM0ojqatke8msR6AshqZNraU1W7wBwO1E7fV8TCLOtkRr0vVUVl6dLoLUPhNF08mJdWJAxoeQZ4p1kM8nPay1Tk8v2HhKtGdRe6uN2hXmOPJLRelFf8nTWqvL5lVlGzIYrB7HHla9F3W4e61dYREuLddWRRhkr81Xqxv7A1QlCsl+4KD0kgeifbAc++3iFp0olPhjfH6+P6Fveb4fRCjNYEO0nEep1EMymUxgvgKHhZyJO9VT8P3rN2g5jmHfvpYjBOL/miD+6zigsXsvAT0SbDUtYCHwIvWEZLmuvqroIwhTY6yp/Agh9hPzC8mAggKY4NAIexyyFEIaxQVnIDNcynKQdwzqmU5YEFHJ4p2JDipH/Vz2XaRyDO7Scpb2VUNJQYWkXPW1Or9M9aXXdsl3NSn1CdPGqj4sprlgAe7hWZEGem8nnNX+RnBxwL9IZrqYv5/Zio6+b5yWwuhxY08+yyXY1Q+OOVABbPzfE7m2bmbHLFTN96zssalVaU52s3LmIcOeMlwVCwvdafcKvn/7ig+4GA1+H3ddlWC9eETj6Avyf4jYYwP8/56KT9d9pCV0fTubAW9YzVd4aMc02QT0oHJ9HYl/YlTOsa8d230Lc2tpOzfW7OYTylZN5745SEvzMB5mOxlVFGI0jaWqJGKGLC5e41gMdboYwwrVCXctMdQIJ7K66FIp4BcqdJrKT1Ry7Zk9XcJvcO0s5j9RZuFc2Q5cfgS/wKlOGG9OVFPcZY+60ehTdy75K20Pp6YOeKH1psi9nU5t11Vif2wPnX8ZoeMDr+ezHojx0QC83Px144dRSuO4aX119fpZkkTqev8B9Xc3Kw==
@@ -701,21 +844,27 @@ Resources:
       - FirehoseLogStream
       - GlueJobTriggerCustomResource
     Properties:
-      DeliveryStreamName: !Ref FirehoseStreamName
+      DeliveryStreamName: !Sub
+        - ${FirehoseStreamName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       DeliveryStreamType: DirectPut
       IcebergDestinationConfiguration:
         RoleARN: !GetAtt FirehoseIcebergDeliveryRole.Arn
         CatalogConfiguration:
           CatalogARN: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
         DestinationTableConfigurationList:
-          - DestinationDatabaseName: !Ref StreamDatabaseName
+          - DestinationDatabaseName: !Sub
+              - ${StreamDatabaseName}_${Timestamp}
+              - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
             DestinationTableName: !Ref StreamTableName
         BufferingHints:
           SizeInMBs: !Ref FirehoseBufferSizeMBs
           IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
         S3Configuration:
           RoleARN: !GetAtt FirehoseIcebergDeliveryRole.Arn
-          BucketARN: !Sub arn:aws:s3:::${IcebergDataBucketName}
+          BucketARN: !Sub
+            - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}
+            - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
           Prefix: !Sub ${StreamTableName}/data/
           ErrorOutputPrefix: !Sub ${StreamTableName}/errors/
           CompressionFormat: UNCOMPRESSED
@@ -732,7 +881,9 @@ Resources:
   PermanentFailureQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub ${LambdaFunctionName}-permanent-failures
+      QueueName: !Sub
+        - ${LambdaFunctionName}-permanent-failures-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
@@ -740,7 +891,9 @@ Resources:
     Type: AWS::SQS::Queue
     DependsOn: PermanentFailureQueue
     Properties:
-      QueueName: !Sub ${LambdaFunctionName}-failed-events
+      QueueName: !Sub
+        - ${LambdaFunctionName}-failed-events-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       MessageRetentionPeriod: 1209600
       VisibilityTimeout: 300
       SqsManagedSseEnabled: true
@@ -756,7 +909,9 @@ Resources:
       - FailedEventsQueue
       - ArtifactUploaderCustomResource
     Properties:
-      FunctionName: !Ref LambdaFunctionName
+      FunctionName: !Sub
+        - ${LambdaFunctionName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Runtime: python3.11
       Handler: lambda_function.lambda_handler
       Role: !GetAtt LambdaFirehoseProcessorRole.Arn
@@ -767,9 +922,13 @@ Resources:
         TargetArn: !GetAtt FailedEventsQueue.Arn
       Environment:
         Variables:
-          FIREHOSE_STREAM_NAME: !Ref FirehoseStreamName
+          FIREHOSE_STREAM_NAME: !Sub
+            - ${FirehoseStreamName}-${Timestamp}
+            - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       Code:
-        S3Bucket: !Ref LambdaScriptBucketName
+        S3Bucket: !Sub
+          - ${LambdaScriptBucketName}-${Timestamp}
+          - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
         S3Key: lambda/lambda_function.zip
 
   # ── Subscription Filter ─────────────────────────────────────────────────
