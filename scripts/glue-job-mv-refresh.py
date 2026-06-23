@@ -1,10 +1,27 @@
 import sys
 import time
 import traceback
+import re
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security Note: Spark SQL does not support parameterized queries for DDL/DML
+# statements. The f-string interpolation used below is the only available
+# mechanism. Values originate from AWS Glue job parameters set by CloudFormation
+# (operator-controlled, not user-supplied at runtime). Input validation below
+# provides defense-in-depth against unexpected values.
+# ─────────────────────────────────────────────────────────────────────────────
+
+IDENTIFIER_PATTERN = re.compile(r'^[a-zA-Z0-9_]+$')
+
+def validate_identifier(value, name):
+    """Validate that a value contains only alphanumeric characters and underscores."""
+    if not IDENTIFIER_PATTERN.match(value):
+        raise ValueError(f"Invalid identifier for {name}: '{value}'. Only alphanumeric characters and underscores are allowed.")
+    return value
 
 args = getResolvedOptions(sys.argv, ["JOB_NAME", "iceberg-data-bucket", "warehouse-database-name", "stream-table-name"])
 sc = SparkContext()
@@ -15,8 +32,14 @@ job.init(args["JOB_NAME"], args)
 
 CATALOG   = "glue_catalog"
 iceberg_data_bucket = args.get("iceberg_data_bucket") or args.get("iceberg-data-bucket") or args["iceberg_data_bucket"]
-warehouse_db_name = args.get("warehouse_database_name") or args.get("warehouse-database-name") or args["warehouse_database_name"]
-stream_table_name = args.get("stream_table_name") or args.get("stream-table-name") or args["stream_table_name"]
+warehouse_db_name = validate_identifier(
+    args.get("warehouse_database_name") or args.get("warehouse-database-name") or args["warehouse_database_name"],
+    "warehouse-database-name"
+)
+stream_table_name = validate_identifier(
+    args.get("stream_table_name") or args.get("stream-table-name") or args["stream_table_name"],
+    "stream-table-name"
+)
 DATABASE  = warehouse_db_name
 MVVIEW    = f"{stream_table_name}_mv"
 WAREHOUSE = f"s3://{iceberg_data_bucket}/{warehouse_db_name}.db"
@@ -41,12 +64,12 @@ def run_step(step_name, fn):
 try:
     # ── Step 1: Refresh materialized view ────────────────────────────────
     run_step("Step 1: FULL refresh MV", lambda:
-        spark.sql(f"REFRESH MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW} FULL"))
+        spark.sql(f"REFRESH MATERIALIZED VIEW {CATALOG}.{DATABASE}.{MVVIEW} FULL"))  # nosec B608
     time.sleep(20)
 
     # ── Step 2: Verify refreshed MV contents ─────────────────────────────
     run_step("Step 2: Verify refreshed MV", lambda:
-        spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())
+        spark.sql(f"SELECT * FROM {CATALOG}.{DATABASE}.{MVVIEW} ORDER BY customer_name").show())  # nosec B608
 
     print("\n=== MV REFRESH JOB COMPLETED SUCCESSFULLY ===")
 

@@ -266,6 +266,10 @@ Resources:
       BucketName: !Sub
         - ${IcebergDataBucketName}-${Timestamp}
         - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -279,6 +283,20 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub
+                - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+              - !Sub
+                - arn:aws:s3:::${IcebergDataBucketName}-${Timestamp}/*
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
           - Sid: !If [LakeFormationEnabled, LakeFormationDataAccess, GlueJobAccess]
             Effect: Allow
             Principal:
@@ -305,11 +323,37 @@ Resources:
       BucketName: !Sub
         - ${IcebergErrorsBucketName}-${Timestamp}
         - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+
+  IcebergErrorsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IcebergErrorsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub
+                - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+              - !Sub
+                - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}/*
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   GlueScriptBucket:
     Type: AWS::S3::Bucket
@@ -318,11 +362,38 @@ Resources:
       BucketName: !Sub
         - ${GlueScriptBucketName}-${Timestamp}
         - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+
+  GlueScriptBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateScriptBucket
+    Properties:
+      Bucket: !Ref GlueScriptBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub
+                - arn:aws:s3:::${GlueScriptBucketName}-${Timestamp}
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+              - !Sub
+                - arn:aws:s3:::${GlueScriptBucketName}-${Timestamp}/*
+                - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   # ── Glue Job IAM Role ───────────────────────────────────────────────────
   GlueJobRole:
@@ -378,9 +449,24 @@ Resources:
                 - Effect: Allow
                   Action:
                     - lakeformation:GetDataAccess
+                  Resource: "*"
+                  Condition:
+                    StringEquals:
+                      aws:ResourceAccount: !Sub ${AWS::AccountId}
+                - Effect: Allow
+                  Action:
                     - lakeformation:GetTemporaryGluePartitionCredentials
                     - lakeformation:GetTemporaryGlueTableCredentials
-                  Resource: "*"
+                  Resource:
+                    - !Sub
+                      - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                      - {}
+                    - !Sub
+                      - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}_${Timestamp}
+                      - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
+                    - !Sub
+                      - arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}_${Timestamp}/*
+                      - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
           - !Ref AWS::NoValue
         - PolicyName: iceberg-s3-emr-access
           PolicyDocument:
@@ -405,12 +491,6 @@ Resources:
                   - !Sub
                     - arn:aws:s3:::${IcebergErrorsBucketName}-${Timestamp}/*
                     - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
-              - Effect: Allow
-                Action: "elasticmapreduce:*"
-                Resource: "*"
-                Condition:
-                  StringEquals:
-                    aws:PrincipalAccount: !Sub ${AWS::AccountId}
         - PolicyName: glue-script-bucket-read
           PolicyDocument:
             Version: "2012-10-17"
@@ -530,7 +610,9 @@ Resources:
     Type: AWS::Logs::LogGroup
     Condition: ShouldCreateSubscriptionLogGroup
     Properties:
-      LogGroupName: !Ref SubscriptionLogGroupName
+      LogGroupName: !Sub
+        - ${SubscriptionLogGroupName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       RetentionInDays: 14
 
   ApplicationLogStream:
@@ -538,7 +620,9 @@ Resources:
     Condition: ShouldCreateSubscriptionLogGroup
     DependsOn: ApplicationLogGroup
     Properties:
-      LogGroupName: !Ref SubscriptionLogGroupName
+      LogGroupName: !Sub
+        - ${SubscriptionLogGroupName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       LogStreamName: test-stream
 
   # ── Firehose Log Group and Stream ───────────────────────────────────────
@@ -664,6 +748,9 @@ Resources:
                 Action:
                   - lakeformation:GetDataAccess
                 Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Sub ${AWS::AccountId}
 
   # ── Glue Job Trigger IAM Role ─────────────────────────────────────────────
   GlueJobTriggerRole:
@@ -939,7 +1026,9 @@ Resources:
       FunctionName: !GetAtt CloudWatchLogsToIcebergFunction.Arn
       Action: lambda:InvokeFunction
       Principal: logs.amazonaws.com
-      SourceArn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${SubscriptionLogGroupName}:*
+      SourceArn: !Sub
+        - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${SubscriptionLogGroupName}-${Timestamp}:*
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
 
   IcebergStreamingSubscriptionFilter:
     Type: AWS::Logs::SubscriptionFilter
@@ -947,7 +1036,9 @@ Resources:
     DependsOn:
       - CloudWatchLogsInvokePermission
     Properties:
-      LogGroupName: !Ref SubscriptionLogGroupName
+      LogGroupName: !Sub
+        - ${SubscriptionLogGroupName}-${Timestamp}
+        - Timestamp: !If [UseCustomSuffix, !Ref ResourceSuffix, !GetAtt TimestampResource.Value]
       FilterName: IcebergStreamingFilter
       FilterPattern: ""
       DestinationArn: !GetAtt CloudWatchLogsToIcebergFunction.Arn

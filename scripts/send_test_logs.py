@@ -7,8 +7,8 @@ import random
 from datetime import datetime, timedelta
 
 # Configuration - change the log group and log stream as needed
-LOG_GROUP_NAME = '/aws/application/logs'
-LOG_STREAM_NAME = 'test-stream'
+LOG_GROUP_NAME = '/aws/application/logs-20260623232021'    #provided example log group name
+LOG_STREAM_NAME = 'test-stream'             #provided example log stream name
 NUM_EVENTS = 1000
 
 # Sample data

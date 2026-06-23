@@ -5,6 +5,12 @@ import gzip
 import os
 from typing import List, Dict, Any
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging Note: This sample logs event metadata and error details to CloudWatch
+# for educational/debugging purposes. Production deployments should sanitize or
+# redact sensitive fields (e.g., customer data, PII) before logging.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Initialize the Firehose client
 firehose_client = boto3.client('firehose')
 DELIVERY_STREAM_NAME = os.environ.get('FIREHOSE_STREAM_NAME', 'iceberg-logs-stream')
@@ -150,6 +156,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         elif 'Records' in event:
             result = process_sqs_records(event)
         else:
+            # WARNING: Production code should sanitize/redact sensitive fields before logging
             print(f"Unknown event format: {json.dumps(event)[:200]}")
             return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown event format'})}
 
