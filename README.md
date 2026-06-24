@@ -4,7 +4,7 @@ An automated deployment of a real-time data pipeline that streams CloudWatch Log
 
 ## Architecture
 
-![Architecture Diagram](https://github.com/aws-samples/sample-log-analytics-iceberg-mv/blob/main/image/Arch-Sample.png
+![Architecture Diagram](image/Arch-Sample.png)
 
 **Components:**
 - **AWS Glue Job (MV Builder)** — Creates the Iceberg database, base table with sample data, and a materialized view for pre-aggregated analytics
