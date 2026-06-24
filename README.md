@@ -8,7 +8,7 @@ An automated deployment of a real-time data pipeline that streams CloudWatch Log
 
 **Components:**
 - **AWS Glue Job (MV Builder)** — Creates the Iceberg database, base table with sample data, and a materialized view for pre-aggregated analytics
-- **AWS Glue Job (MV Refresh)** — Refreshes the materialized view on a 30-minute schedule via a Glue trigger
+- **AWS Glue Job (MV Refresh)** — Refreshes the materialized view on a daily schedule via a Glue trigger
 - **AWS Lambda** — Processes CloudWatch Logs events, extracts structured fields, and forwards to Firehose
 - **Amazon Data Firehose** — Buffers and delivers records to the Iceberg table with Iceberg destination
 - **CloudWatch Subscription Filter** — Connects a log group to the Lambda function
@@ -20,17 +20,18 @@ An automated deployment of a real-time data pipeline that streams CloudWatch Log
 
 ```
 ├── cloudformation/
-│   ├── iceberg-pipeline.yaml               # Consolidated single-stack template (recommended)
-│   ├── iceberg-pipeline-glue.yaml          # Glue stack (with Lake Formation) - legacy
-│   ├── iceberg-pipeline-glue-no-lakeformation.yaml  # Glue stack (no Lake Formation) - legacy
-│   └── iceberg-pipeline-firehose.yaml      # Firehose + Lambda stack - legacy
+│   └── iceberg-pipeline.yaml               # Single-stack CloudFormation template
+├── images/
+│   └── Arch-Sample.png                     # Architecture diagram
 ├── scripts/
-│   ├── deploy.sh                           # Legacy upload script (no longer needed)
 │   ├── sample-glue-job-iceberg-materializedview-builder.py  # Glue ETL script
 │   ├── glue-job-mv-refresh.py             # Glue MV refresh script
 │   ├── lambda_function.py                  # Lambda function code
 │   └── send_test_logs.py                   # Test script to send sample logs
-├── tests/                                  # pytest test suite
+├── CODE_OF_CONDUCT.md
+├── CONTRIBUTING.md
+├── LICENSE
+├── README.md
 └── requirements.txt                        # Python dependencies
 ```
 
@@ -46,6 +47,8 @@ An automated deployment of a real-time data pipeline that streams CloudWatch Log
   - **CloudWatch Logs** — create log groups, subscription filters
   - **Amazon SQS** — create queues
   - **Amazon Athena** — run queries to verify Iceberg table data
+  - **Python 3.9+** (for running the test script and test suite)
+  - **AWS CLI v2** (if deploying via CLI)
 
 > **Tip:** For a quick start, use an IAM principal with `AdministratorAccess`. For production, scope permissions down to the specific resources created by the stack.
 
@@ -57,6 +60,8 @@ An automated deployment of a real-time data pipeline that streams CloudWatch Log
 
 Deploy the entire solution with a single CloudFormation stack. The template automatically creates S3 buckets, uploads all scripts, provisions IAM roles, configures Firehose, and runs the Glue job to create the Iceberg table and materialized view.
 
+Resource names are automatically suffixed with a timestamp for uniqueness. To use a custom suffix instead, pass the `ResourceSuffix` parameter.
+
 **Via CLI:**
 
 ```bash
@@ -64,9 +69,23 @@ aws cloudformation deploy \
   --template-file cloudformation/iceberg-pipeline.yaml \
   --stack-name iceberg-pipeline \
   --parameter-overrides \
-    IcebergDataBucketName="your-company-iceberg-data-ACCOUNT_ID-REGION" \
-    IcebergErrorsBucketName="your-company-iceberg-errors-ACCOUNT_ID-REGION" \
-    GlueScriptBucketName="your-company-scripts-ACCOUNT_ID-REGION" \
+    IcebergDataBucketName="your-company-iceberg-data" \
+    IcebergErrorsBucketName="your-company-iceberg-errors" \
+    GlueScriptBucketName="your-company-glue-scripts" \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+To specify a custom suffix (instead of auto-generated timestamp):
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/iceberg-pipeline.yaml \
+  --stack-name iceberg-pipeline \
+  --parameter-overrides \
+    IcebergDataBucketName="your-company-iceberg-data" \
+    IcebergErrorsBucketName="your-company-iceberg-errors" \
+    GlueScriptBucketName="your-company-glue-scripts" \
+    ResourceSuffix="prod01" \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
@@ -75,10 +94,12 @@ aws cloudformation deploy \
 1. Go to **CloudFormation console** → **Create stack** → **Upload a template file**
 2. Upload `cloudformation/iceberg-pipeline.yaml`
 3. Review parameters — they are grouped into **[REQUIRED]** and **Safe defaults**:
+   - Provide globally unique S3 bucket base names (a timestamp or custom suffix is appended automatically)
    - Set `CreateScriptBucket` to `false` if reusing an existing S3 bucket
    - Set `EnableLakeFormation` to `true` if your account uses Lake Formation
-   - Provide globally unique S3 bucket names
-4. Check IAM capabilities → **Submit**
+   - Set `CreateSubscriptionLogGroup` to `false` if the log group already exists
+   - Optionally set `ResourceSuffix` to a custom value (e.g., `prod01`). Leave blank for auto-generated timestamp.
+4. Check **I acknowledge that AWS CloudFormation might create IAM resources with custom names** → **Submit**
 
 The stack takes approximately 10–15 minutes to complete.
 
@@ -87,6 +108,9 @@ The stack takes approximately 10–15 minutes to complete.
 Send sample log events matching the Iceberg table schema to the CloudWatch Log Group:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 python3 scripts/send_test_logs.py
 ```
 
@@ -106,52 +130,47 @@ SELECT * FROM stream_analytics.application_logs_mv ORDER BY customer_name;
 
 ### Automated materialized view refresh
 
-The stack provisions a scheduled Glue trigger that automatically runs the MV refresh job every 30 minutes. As new data streams in through Firehose, the trigger keeps the materialized view current without manual intervention.
+The stack provisions a scheduled Glue trigger that automatically runs the MV refresh job daily at midnight (UTC). As new data streams in through Firehose, the trigger keeps the materialized view current without manual intervention.
 
 ## Key Parameters
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `IcebergDataBucketName` | Yes | S3 bucket for Iceberg table data (must be globally unique) |
-| `IcebergErrorsBucketName` | Yes | S3 bucket for failed records (must be globally unique) |
-| `GlueScriptBucketName` | Yes | S3 bucket for scripts (must be globally unique) |
+| `IcebergDataBucketName` | Yes | Base name for the Iceberg data bucket (suffix appended automatically) |
+| `IcebergErrorsBucketName` | Yes | Base name for the failed records bucket (suffix appended automatically) |
+| `GlueScriptBucketName` | Yes | Base name for the scripts bucket (suffix appended automatically) |
 | `CreateScriptBucket` | Yes | Set to `false` if the script bucket already exists |
 | `EnableLakeFormation` | Yes | Set to `true` if using Lake Formation |
 | `CreateSubscriptionLogGroup` | Yes | Set to `false` if the log group already exists |
+| `ResourceSuffix` | No | Custom suffix for resource names. Leave blank for auto-timestamp. Use only lowercase letters and numbers. |
 
-> **Naming pattern:** `{company}-{project}-{purpose}-{account-id}-{region}`
-
-## Legacy Multi-Stack Deployment
-
-The `cloudformation/` directory also contains the original split templates for reference:
-
-| Template | Description |
-|----------|-------------|
-| `iceberg-pipeline-glue.yaml` | Glue stack with Lake Formation |
-| `iceberg-pipeline-glue-no-lakeformation.yaml` | Glue stack without Lake Formation |
-| `iceberg-pipeline-firehose.yaml` | Firehose + Lambda stack |
-
-These require the manual `scripts/deploy.sh` step and multi-stack deployment. The consolidated `iceberg-pipeline.yaml` is recommended.
+> **Naming result:** `{base-name}-{suffix}` — e.g., `your-company-iceberg-data-20250624143022` or `your-company-iceberg-data-prod01`
 
 ## Cleanup
 
+**Via Console:**
+
+1. Go to **CloudFormation console** → select your stack → **Delete**
+2. Empty and delete the S3 buckets manually from the **S3 console** (CloudFormation cannot delete non-empty buckets)
+
+**Via CLI:**
+
 ```bash
+# Empty and delete S3 buckets (replace with your actual bucket names including suffix)
+aws s3 rm s3://your-company-iceberg-data-SUFFIX --recursive
+aws s3 rb s3://your-company-iceberg-data-SUFFIX
+aws s3 rm s3://your-company-iceberg-errors-SUFFIX --recursive
+aws s3 rb s3://your-company-iceberg-errors-SUFFIX
+aws s3 rm s3://your-company-glue-scripts-SUFFIX --recursive
+aws s3 rb s3://your-company-glue-scripts-SUFFIX
+
 # Delete the stack
 aws cloudformation delete-stack --stack-name iceberg-pipeline
-
-# Empty and delete S3 buckets (replace with your bucket names)
-aws s3 rm s3://your-company-scripts-ACCOUNT_ID-REGION --recursive
-aws s3 rb s3://your-company-scripts-ACCOUNT_ID-REGION
-aws s3 rm s3://your-company-iceberg-data-ACCOUNT_ID-REGION --recursive
-aws s3 rb s3://your-company-iceberg-data-ACCOUNT_ID-REGION
-aws s3 rm s3://your-company-iceberg-errors-ACCOUNT_ID-REGION --recursive
-aws s3 rb s3://your-company-iceberg-errors-ACCOUNT_ID-REGION
 ```
 
 ## Running Tests
 
 ```bash
-pip install -r requirements.txt
 python -m pytest tests/ -v
 ```
 
