@@ -4,12 +4,7 @@ An automated deployment of a real-time data pipeline that streams CloudWatch Log
 
 ## Architecture
 
-```
-Application → CloudWatch Logs → Lambda → Firehose → Apache Iceberg (S3 + Glue Catalog) → Athena
-                                   ↕                        ↑
-                              SQS (DLQ)              Glue MV Refresh
-                                                     (every 30 min)
-```
+![Architecture Diagram](https://github.com/aws-samples/sample-log-analytics-iceberg-mv/blob/main/image/Arch-Sample.png
 
 **Components:**
 - **AWS Glue Job (MV Builder)** — Creates the Iceberg database, base table with sample data, and a materialized view for pre-aggregated analytics
@@ -57,8 +52,6 @@ Application → CloudWatch Logs → Lambda → Firehose → Apache Iceberg (S3 +
 ## Deployment
 
 ### Launch Stack
-
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/new?stackName=iceberg-pipeline&templateURL=https://raw.githubusercontent.com/aws-samples/sample-log-analytics-iceberg-mv/main/cloudformation/iceberg-pipeline.yaml)
 
 ### Step 1: Deploy the pipeline stack
 
